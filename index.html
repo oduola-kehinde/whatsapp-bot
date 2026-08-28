@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WhatsApp Bot Dashboard</title>
+<style>
+body { font-family: Arial; text-align: center; background: #f0f2f5; padding: 20px; }
+#qr { width: 280px; height: 280px; background: white; margin: 20px auto; display: flex; align-items: center; justify-content: center; border-radius: 15px; }
+h2 { color: #075E54; }
+#status { font-weight: bold; margin-top: 15px; }
+img { width: 100%; }
+</style>
+</head>
+<body>
+<h2>WhatsApp Bot Dashboard</h2>
+<div id="qr">Waiting for QR...</div>
+<div id="status">Initializing...</div>
+<script>
+async function update(){
+  try{
+    const res = await fetch('/status');
+    const data = await res.json();
+    if(data.ready){
+      document.getElementById('qr').innerHTML = '<h1>Bot Ready</h1>';
+      document.getElementById('status').innerText = 'Connected';
+    } else if(data.qr){
+      document.getElementById('qr').innerHTML = '<img src="' + data.qr + '">';
+      document.getElementById('status').innerText = 'Scan with WhatsApp';
+    }
+  }catch(e){}
+}
+setInterval(update, 2000);
+update();
+</script>
+</body>
+</html>
