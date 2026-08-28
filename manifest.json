@@ -1,0 +1,7 @@
+{
+  "name": "WhatsApp Bot",
+  "short_name": "WA Bot",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#ffffff"
+}
