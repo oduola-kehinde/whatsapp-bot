@@ -1,0 +1,12 @@
+﻿node_modules
+.wwebjs_auth
+.wwebjs_cache
+auth_info_baileys
+data
+logs
+storage
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.local

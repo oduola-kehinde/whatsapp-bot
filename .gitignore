@@ -9,3 +9,14 @@
 .env
 .wwebjs_auth
 node_modules
+.baileys_auth/
+.baileys_status_auth/
+auth_info_baileys/
+.wwebjs_auth/
+.wwebjs_cache/
+.env
+.env.local
+.env.*.local
+node_modules/
+*.log
+status-worker-qr.png

@@ -1,0 +1,370 @@
+﻿"use strict";
+
+const path = require("path");
+const fs = require("fs");
+const {
+    Client,
+    LocalAuth
+} = require("whatsapp-web.js");
+const puppeteer = require("puppeteer");
+const EventEmitter = require("events");
+
+class WhatsAppSessionManager extends EventEmitter {
+    constructor(options = {}) {
+        super();
+
+        this.sessions = new Map();
+
+        this.baseAuthPath =
+            options.authPath ||
+            process.env.WHATSAPP_SESSION_PATH ||
+            path.join(process.cwd(), ".wwebjs_auth");
+
+        this.headless =
+            options.headless !== false;
+
+        this.chromePath =
+            options.chromePath ||
+            puppeteer.executablePath();
+
+        fs.mkdirSync(this.baseAuthPath, {
+            recursive: true
+        });
+    }
+
+    normalizeId(accountId) {
+        const id = String(accountId || "").trim();
+
+        if (!id) {
+            throw new Error("WhatsApp account ID is required");
+        }
+
+        if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+            throw new Error("Invalid WhatsApp account ID");
+        }
+
+        return id;
+    }
+
+    get(accountId) {
+        return this.sessions.get(
+            this.normalizeId(accountId)
+        ) || null;
+    }
+
+    has(accountId) {
+        return this.sessions.has(
+            this.normalizeId(accountId)
+        );
+    }
+
+    status(accountId) {
+        const id = this.normalizeId(accountId);
+        const session = this.sessions.get(id);
+
+        if (!session) {
+            return {
+                accountId: id,
+                status: "stopped",
+                ready: false,
+                phone: null,
+                pushname: null,
+                platform: null
+            };
+        }
+
+        return {
+            accountId: id,
+            status: session.status,
+            ready: session.ready,
+            phone: session.phone,
+            pushname: session.pushname,
+            platform: session.platform
+        };
+    }
+
+    allStatuses() {
+        return Array.from(
+            this.sessions.keys()
+        ).map((id) => this.status(id));
+    }
+
+    createClient(accountId) {
+        const id = this.normalizeId(accountId);
+
+        const client = new Client({
+            authStrategy: new LocalAuth({
+                clientId: `account-${id}`,
+                dataPath: this.baseAuthPath
+            }),
+
+            puppeteer: {
+                headless: this.headless,
+                executablePath: this.chromePath,
+                args: [
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--no-first-run",
+                    "--no-zygote",
+                    "--disable-extensions"
+                ]
+            }
+        });
+
+        const session = {
+            accountId: id,
+            client,
+            status: "created",
+            ready: false,
+            phone: null,
+            pushname: null,
+            platform: null,
+            startedAt: new Date(),
+            lastError: null
+        };
+
+        this.sessions.set(id, session);
+
+        client.on("qr", (qr) => {
+            session.status = "qr";
+            session.ready = false;
+
+            this.emit("qr", {
+                accountId: id,
+                qr
+            });
+        });
+
+        client.on("authenticated", () => {
+            session.status = "authenticated";
+
+            this.emit("authenticated", {
+                accountId: id
+            });
+        });
+
+        client.on("ready", () => {
+            session.status = "ready";
+            session.ready = true;
+
+            try {
+                const info = client.info;
+
+                session.phone =
+                    info?.wid?.user ||
+                    null;
+
+                session.pushname =
+                    info?.pushname ||
+                    null;
+
+                session.platform =
+                    info?.platform ||
+                    null;
+            } catch (error) {
+                session.lastError =
+                    error.message;
+            }
+
+            this.emit("ready", {
+                accountId: id,
+                info: {
+                    phone: session.phone,
+                    pushname: session.pushname,
+                    platform: session.platform
+                }
+            });
+        });
+
+        client.on("auth_failure", (message) => {
+            session.status = "auth_failure";
+            session.ready = false;
+            session.lastError = String(message);
+
+            this.emit("auth_failure", {
+                accountId: id,
+                message: String(message)
+            });
+        });
+
+        client.on("disconnected", (reason) => {
+            session.status = "disconnected";
+            session.ready = false;
+
+            this.emit("disconnected", {
+                accountId: id,
+                reason: String(reason)
+            });
+        });
+
+        client.on("change_state", (state) => {
+            this.emit("change_state", {
+                accountId: id,
+                state
+            });
+        });
+
+        client.on("message", async (message) => {
+            this.emit("message", {
+                accountId: id,
+                message
+            });
+        });
+
+        client.on("error", (error) => {
+            session.status = "error";
+            session.ready = false;
+            session.lastError = error.message;
+
+            this.emit("error", {
+                accountId: id,
+                error
+            });
+        });
+
+        return session;
+    }
+
+    async start(accountId) {
+        const id = this.normalizeId(accountId);
+
+        let session = this.sessions.get(id);
+
+        if (session?.ready) {
+            return this.status(id);
+        }
+
+        if (!session) {
+            session = this.createClient(id);
+        }
+
+        if (session.status === "starting") {
+            return this.status(id);
+        }
+
+        session.status = "starting";
+        session.lastError = null;
+
+        try {
+            await session.client.initialize();
+
+            return this.status(id);
+        } catch (error) {
+            session.status = "error";
+            session.ready = false;
+            session.lastError = error.message;
+
+            this.emit("error", {
+                accountId: id,
+                error
+            });
+
+            throw error;
+        }
+    }
+
+    async stop(accountId) {
+        const id = this.normalizeId(accountId);
+        const session = this.sessions.get(id);
+
+        if (!session) {
+            return this.status(id);
+        }
+
+        try {
+            await session.client.destroy();
+        } finally {
+            session.status = "stopped";
+            session.ready = false;
+        }
+
+        return this.status(id);
+    }
+
+    async restart(accountId) {
+        const id = this.normalizeId(accountId);
+
+        await this.stop(id);
+
+        this.sessions.delete(id);
+
+        return this.start(id);
+    }
+
+    async sendMessage(accountId, number, text) {
+        const id = this.normalizeId(accountId);
+        const session = this.sessions.get(id);
+
+        if (!session) {
+            throw new Error(
+                `WhatsApp account ${id} is not running`
+            );
+        }
+
+        if (!session.ready) {
+            throw new Error(
+                `WhatsApp account ${id} is not connected`
+            );
+        }
+
+        const cleanNumber =
+            String(number || "")
+                .replace(/[^\d]/g, "");
+
+        if (!cleanNumber) {
+            throw new Error(
+                "WhatsApp destination number is required"
+            );
+        }
+
+        const body =
+            String(text || "").trim();
+
+        if (!body) {
+            throw new Error(
+                "Message text is required"
+            );
+        }
+
+        const chatId =
+            `${cleanNumber}@c.us`;
+
+        const registered =
+            await session.client
+                .isRegisteredUser(chatId);
+
+        if (!registered) {
+            throw new Error(
+                "This number is not registered on WhatsApp"
+            );
+        }
+
+        return session.client.sendMessage(
+            chatId,
+            body
+        );
+    }
+
+    async destroyAll() {
+        const ids =
+            Array.from(this.sessions.keys());
+
+        for (const id of ids) {
+            try {
+                await this.stop(id);
+            } catch (error) {
+                console.error(
+                    `Failed to stop WhatsApp account ${id}:`,
+                    error.message
+                );
+            }
+        }
+
+        this.sessions.clear();
+    }
+}
+
+module.exports = WhatsAppSessionManager;

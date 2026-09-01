@@ -1,0 +1,2996 @@
+﻿require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const QRCode = require("qrcode");
+const qrcodeTerminal = require("qrcode-terminal");
+const { Pool } = require("pg");
+const path = require("path");
+const fs = require("fs");
+
+const {
+    Client,
+    LocalAuth
+} = require("whatsapp-web.js");
+
+/*
+|--------------------------------------------------------------------------
+| CONFIGURATION
+|--------------------------------------------------------------------------
+*/
+
+const app = express();
+
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || "0.0.0.0";
+
+const JWT_SECRET =
+    process.env.JWT_SECRET ||
+    "CHANGE_THIS_SECRET_BEFORE_PRODUCTION";
+
+const WORKER_ID =
+    process.env.WORKER_ID ||
+    "main-bot";
+
+const NODE_ENV =
+    process.env.NODE_ENV ||
+    "development";
+
+/*
+|--------------------------------------------------------------------------
+| EXPRESS
+|--------------------------------------------------------------------------
+*/
+
+app.disable("x-powered-by");
+
+app.use(
+    cors({
+        origin: true,
+        credentials: true
+    })
+);
+
+app.use(
+    express.json({
+        limit: "10mb"
+    })
+);
+
+app.use(
+    express.urlencoded({
+        extended: true,
+        limit: "10mb"
+    })
+);
+
+app.use(
+    express.static(
+        path.join(__dirname, "public")
+    )
+);
+
+/*
+|--------------------------------------------------------------------------
+| DATABASE
+|--------------------------------------------------------------------------
+*/
+
+let pool = null;
+
+if (process.env.DATABASE_URL) {
+    pool = new Pool({
+        connectionString:
+            process.env.DATABASE_URL,
+
+        ssl:
+            process.env.DATABASE_SSL === "false"
+                ? false
+                : {
+                    rejectUnauthorized: false
+                },
+
+        max:
+            Number(
+                process.env.DB_POOL_MAX || 10
+            ),
+
+        idleTimeoutMillis: 30000,
+
+        connectionTimeoutMillis: 10000
+    });
+
+    pool.on(
+        "error",
+        error => {
+            console.error(
+                "PostgreSQL pool error:",
+                error.message
+            );
+        }
+    );
+
+    console.log(
+        "PostgreSQL configured."
+    );
+} else {
+    console.warn(
+        "WARNING: DATABASE_URL is not configured."
+    );
+}
+
+async function db(
+    queryText,
+    params = []
+) {
+    if (!pool) {
+        throw new Error(
+            "DATABASE_URL is not configured."
+        );
+    }
+
+    return pool.query(
+        queryText,
+        params
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| DATABASE INITIALIZATION
+|--------------------------------------------------------------------------
+*/
+
+async function initializeDatabase() {
+
+    if (!pool) {
+        console.log(
+            "Skipping database initialization."
+        );
+        return;
+    }
+
+    await db(`
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+
+            email TEXT UNIQUE NOT NULL,
+
+            password_hash TEXT NOT NULL,
+
+            role TEXT NOT NULL
+                DEFAULT 'customer',
+
+            created_at TIMESTAMPTZ NOT NULL
+                DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS whatsapp_accounts (
+            id SERIAL PRIMARY KEY,
+
+            user_id INTEGER
+                REFERENCES users(id)
+                ON DELETE CASCADE,
+
+            name TEXT NOT NULL,
+
+            phone TEXT,
+
+            status TEXT NOT NULL
+                DEFAULT 'disconnected',
+
+            session_name TEXT UNIQUE NOT NULL,
+
+            created_at TIMESTAMPTZ NOT NULL
+                DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+
+            whatsapp_account_id INTEGER
+                REFERENCES whatsapp_accounts(id)
+                ON DELETE CASCADE,
+
+            remote_number TEXT,
+
+            direction TEXT NOT NULL,
+
+            message_type TEXT NOT NULL
+                DEFAULT 'text',
+
+            body TEXT,
+
+            media_url TEXT,
+
+            created_at TIMESTAMPTZ NOT NULL
+                DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS automation_rules (
+            id SERIAL PRIMARY KEY,
+
+            whatsapp_account_id INTEGER
+                REFERENCES whatsapp_accounts(id)
+                ON DELETE CASCADE,
+
+            trigger_text TEXT NOT NULL,
+
+            reply_text TEXT NOT NULL,
+
+            enabled BOOLEAN NOT NULL
+                DEFAULT TRUE,
+
+            created_at TIMESTAMPTZ NOT NULL
+                DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS media (
+            id SERIAL PRIMARY KEY,
+
+            whatsapp_account_id INTEGER
+                REFERENCES whatsapp_accounts(id)
+                ON DELETE CASCADE,
+
+            filename TEXT NOT NULL,
+
+            mime_type TEXT,
+
+            storage_url TEXT,
+
+            created_at TIMESTAMPTZ NOT NULL
+                DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS
+            idx_messages_created_at
+        ON messages(created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS
+            idx_messages_remote_number
+        ON messages(remote_number);
+
+        CREATE INDEX IF NOT EXISTS
+            idx_accounts_user_id
+        ON whatsapp_accounts(user_id);
+
+        CREATE INDEX IF NOT EXISTS
+            idx_rules_account_id
+        ON automation_rules(
+            whatsapp_account_id
+        );
+    `);
+
+    console.log(
+        "Database initialized successfully."
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| JWT AUTHENTICATION
+|--------------------------------------------------------------------------
+*/
+
+function createToken(user) {
+
+    return jwt.sign(
+        {
+            id: user.id,
+            email: user.email,
+            role: user.role
+        },
+
+        JWT_SECRET,
+
+        {
+            expiresIn:
+                process.env.JWT_EXPIRES_IN ||
+                "7d"
+        }
+    );
+}
+
+function auth(
+    req,
+    res,
+    next
+) {
+
+    const header =
+        req.headers.authorization || "";
+
+    if (
+        !header.startsWith(
+            "Bearer "
+        )
+    ) {
+        return res.status(401).json({
+            ok: false,
+            error:
+                "Authentication required"
+        });
+    }
+
+    const token =
+        header.substring(7);
+
+    try {
+
+        req.user =
+            jwt.verify(
+                token,
+                JWT_SECRET
+            );
+
+        next();
+
+    } catch {
+
+        return res.status(401).json({
+            ok: false,
+            error:
+                "Invalid or expired token"
+        });
+    }
+}
+
+function adminOnly(
+    req,
+    res,
+    next
+) {
+
+    if (
+        req.user.role !== "admin"
+    ) {
+        return res.status(403).json({
+            ok: false,
+            error:
+                "Administrator access required"
+        });
+    }
+
+    next();
+}
+
+/*
+|--------------------------------------------------------------------------
+| WHATSAPP STATE
+|--------------------------------------------------------------------------
+*/
+
+let whatsappClient = null;
+
+let whatsappReady = false;
+
+let whatsappState =
+    "STARTING";
+
+let whatsappInfo = null;
+
+let lastQR = null;
+
+let whatsappStarting = false;
+
+/*
+|--------------------------------------------------------------------------
+| CHROME / PUPPETEER
+|--------------------------------------------------------------------------
+*/
+
+function getChromePath() {
+
+    if (process.env.CHROME_BIN) {
+
+        return process.env.CHROME_BIN;
+    }
+
+    try {
+
+        const puppeteer =
+            require("puppeteer");
+
+        if (
+            puppeteer &&
+            typeof puppeteer.executablePath ===
+                "function"
+        ) {
+
+            const executable =
+                puppeteer.executablePath();
+
+            if (
+                executable &&
+                fs.existsSync(executable)
+            ) {
+
+                return executable;
+            }
+        }
+
+    } catch (error) {
+
+        console.warn(
+            "Unable to detect Puppeteer Chrome:",
+            error.message
+        );
+    }
+
+    return undefined;
+}
+
+/*
+|--------------------------------------------------------------------------
+| ACCOUNT HELPERS
+|--------------------------------------------------------------------------
+*/
+
+async function getMainAccountId() {
+
+    if (!pool) {
+        return null;
+    }
+
+    try {
+
+        const result =
+            await db(`
+                SELECT id
+                FROM whatsapp_accounts
+                ORDER BY id ASC
+                LIMIT 1
+            `);
+
+        return (
+            result.rows[0]?.id ||
+            null
+        );
+
+    } catch {
+
+        return null;
+    }
+}
+
+async function updateMainAccount(
+    status,
+    phone = null
+) {
+
+    if (!pool) {
+        return;
+    }
+
+    try {
+
+        const accountId =
+            await getMainAccountId();
+
+        if (!accountId) {
+            return;
+        }
+
+        await db(`
+            UPDATE whatsapp_accounts
+            SET
+                status=$1,
+                phone=$2
+            WHERE id=$3
+        `, [
+            status,
+            phone,
+            accountId
+        ]);
+
+    } catch (error) {
+
+        console.error(
+            "Account update error:",
+            error.message
+        );
+    }
+}
+
+/*
+|--------------------------------------------------------------------------
+| CREATE WHATSAPP CLIENT
+|--------------------------------------------------------------------------
+*/
+
+function createWhatsAppClient() {
+
+    const chromePath =
+        getChromePath();
+
+    if (chromePath) {
+
+        console.log(
+            "Chrome executable:",
+            chromePath
+        );
+
+    } else {
+
+        console.log(
+            "Puppeteer will use its configured browser."
+        );
+    }
+
+    const clientOptions = {
+
+        authStrategy:
+            new LocalAuth({
+                clientId:
+                    WORKER_ID,
+
+                dataPath:
+                    process.env.WHATSAPP_SESSION_PATH ||
+                    path.join(
+                        __dirname,
+                        ".wwebjs_auth"
+                    )
+            }),
+
+        puppeteer: {
+
+            headless: true,
+
+            args: [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-zygote",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-features=Translate,BackForwardCache"
+            ]
+        }
+    };
+
+    if (chromePath) {
+
+        clientOptions.puppeteer.executablePath =
+            chromePath;
+    }
+
+    const client =
+        new Client(
+            clientOptions
+        );
+
+    /*
+    |--------------------------------------------------------------------------
+    | QR CODE
+    |--------------------------------------------------------------------------
+    */
+
+    client.on(
+        "qr",
+        qr => {
+
+            lastQR = qr;
+
+            whatsappReady =
+                false;
+
+            whatsappState =
+                "QR_REQUIRED";
+
+            console.log("");
+
+            console.log(
+                "======================================"
+            );
+
+            console.log(
+                "WHATSAPP QR CODE REQUIRED"
+            );
+
+            console.log(
+                "SCAN THE QR CODE WITH WHATSAPP"
+            );
+
+            console.log(
+                "======================================"
+            );
+
+            qrcodeTerminal.generate(
+                qr,
+                {
+                    small: true
+                }
+            );
+
+            console.log("");
+
+            updateMainAccount(
+                "qr_required"
+            );
+        }
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | AUTHENTICATED
+    |--------------------------------------------------------------------------
+    */
+
+    client.on(
+        "authenticated",
+        () => {
+
+            whatsappState =
+                "AUTHENTICATED";
+
+            console.log(
+                "WhatsApp authentication successful."
+            );
+        }
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | READY
+    |--------------------------------------------------------------------------
+    */
+
+    client.on(
+        "ready",
+        async () => {
+
+            whatsappReady =
+                true;
+
+            lastQR = null;
+
+            whatsappState =
+                "READY";
+
+            try {
+
+                whatsappInfo = {
+
+                    pushname:
+                        client.info?.pushname ||
+                        null,
+
+                    phone:
+                        client.info?.wid?.user ||
+                        null,
+
+                    platform:
+                        client.info?.platform ||
+                        null
+                };
+
+            } catch {
+
+                whatsappInfo =
+                    null;
+            }
+
+            console.log("");
+
+            console.log(
+                "======================================"
+            );
+
+            console.log(
+                "WHATSAPP CONNECTED"
+            );
+
+            console.log(
+                "======================================"
+            );
+
+            console.log(
+                "Number:",
+                whatsappInfo?.phone ||
+                "unknown"
+            );
+
+            console.log(
+                "Name:",
+                whatsappInfo?.pushname ||
+                "unknown"
+            );
+
+            console.log(
+                "Platform:",
+                whatsappInfo?.platform ||
+                "unknown"
+            );
+
+            console.log("");
+
+            await updateMainAccount(
+                "connected",
+                whatsappInfo?.phone ||
+                null
+            );
+        }
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | AUTH FAILURE
+    |--------------------------------------------------------------------------
+    */
+
+    client.on(
+        "auth_failure",
+        message => {
+
+            whatsappReady =
+                false;
+
+            whatsappState =
+                "AUTH_FAILURE";
+
+            console.error(
+                "WhatsApp authentication failure:",
+                message
+            );
+
+            updateMainAccount(
+                "auth_failure"
+            );
+        }
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | DISCONNECTED
+    |--------------------------------------------------------------------------
+    */
+
+    client.on(
+        "disconnected",
+        reason => {
+
+            whatsappReady =
+                false;
+
+            whatsappState =
+                "DISCONNECTED";
+
+            whatsappInfo =
+                null;
+
+            console.log(
+                "WhatsApp disconnected:",
+                reason
+            );
+
+            updateMainAccount(
+                "disconnected"
+            );
+        }
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | INCOMING MESSAGE
+    |--------------------------------------------------------------------------
+    */
+
+    client.on(
+        "message",
+        async message => {
+
+            try {
+
+                const text =
+                    String(
+                        message.body || ""
+                    ).trim();
+
+                if (!text) {
+                    return;
+                }
+
+                console.log(
+                    `[MESSAGE] ${message.from}: ${text}`
+                );
+
+                /*
+                |--------------------------------------------------------------------------
+                | GET MAIN ACCOUNT
+                |--------------------------------------------------------------------------
+                */
+
+                const accountId =
+                    await getMainAccountId();
+
+                /*
+                |--------------------------------------------------------------------------
+                | SAVE INCOMING MESSAGE
+                |--------------------------------------------------------------------------
+                */
+
+                if (pool) {
+
+                    try {
+
+                        await db(`
+                            INSERT INTO messages
+                            (
+                                whatsapp_account_id,
+                                remote_number,
+                                direction,
+                                message_type,
+                                body
+                            )
+                            VALUES
+                            ($1,$2,$3,$4,$5)
+                        `, [
+                            accountId,
+                            message.from,
+                            "incoming",
+                            "text",
+                            text
+                        ]);
+
+                    } catch (error) {
+
+                        console.error(
+                            "Incoming message database error:",
+                            error.message
+                        );
+                    }
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | BUILT-IN COMMANDS
+                |--------------------------------------------------------------------------
+                */
+
+                const command =
+                    text.toLowerCase();
+
+                if (
+                    command === "!ping"
+                ) {
+
+                    await message.reply(
+                        "pong"
+                    );
+
+                    return;
+                }
+
+                if (
+                    command === "!status"
+                ) {
+
+                    await message.reply(
+                        whatsappReady
+                            ? "Bot is online and connected."
+                            : "Bot is currently offline."
+                    );
+
+                    return;
+                }
+
+                if (
+                    command === "!help"
+                ) {
+
+                    await message.reply(
+                        "WhatsApp Bot Commands\n\n" +
+                        "!ping - Test the bot\n" +
+                        "!status - Check bot status\n" +
+                        "!help - Show commands"
+                    );
+
+                    return;
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | AUTOMATION RULES
+                |--------------------------------------------------------------------------
+                */
+
+                if (
+                    pool &&
+                    accountId
+                ) {
+
+                    try {
+
+                        const rules =
+                            await db(`
+                                SELECT
+                                    id,
+                                    trigger_text,
+                                    reply_text,
+                                    enabled
+                                FROM automation_rules
+                                WHERE
+                                    whatsapp_account_id=$1
+                                    AND enabled=true
+                                ORDER BY id ASC
+                            `, [
+                                accountId
+                            ]);
+
+                        const matchedRule =
+                            rules.rows.find(
+                                rule => {
+
+                                    const trigger =
+                                        String(
+                                            rule.trigger_text ||
+                                            ""
+                                        )
+                                        .trim()
+                                        .toLowerCase();
+
+                                    return (
+                                        trigger &&
+                                        command ===
+                                            trigger
+                                    );
+                                }
+                            );
+
+                        if (
+                            matchedRule
+                        ) {
+
+                            await message.reply(
+                                matchedRule.reply_text
+                            );
+
+                            await db(`
+                                INSERT INTO messages
+                                (
+                                    whatsapp_account_id,
+                                    remote_number,
+                                    direction,
+                                    message_type,
+                                    body
+                                )
+                                VALUES
+                                ($1,$2,$3,$4,$5)
+                            `, [
+                                accountId,
+                                message.from,
+                                "outgoing",
+                                "text",
+                                matchedRule.reply_text
+                            ]);
+                        }
+
+                    } catch (error) {
+
+                        console.error(
+                            "Automation error:",
+                            error.message
+                        );
+                    }
+                }
+
+            } catch (error) {
+
+                console.error(
+                    "Message handler error:",
+                    error
+                );
+            }
+        }
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | WHATSAPP ERROR
+    |--------------------------------------------------------------------------
+    */
+
+    client.on(
+        "error",
+        error => {
+
+            console.error(
+                "WhatsApp client error:",
+                error
+            );
+        }
+    );
+
+    return client;
+}
+
+/*
+|--------------------------------------------------------------------------
+| START WHATSAPP
+|--------------------------------------------------------------------------
+*/
+
+async function startWhatsApp() {
+
+    if (whatsappStarting) {
+        return;
+    }
+
+    whatsappStarting =
+        true;
+
+    whatsappState =
+        "STARTING";
+
+    console.log(
+        "Starting WhatsApp client..."
+    );
+
+    try {
+
+        whatsappClient =
+            createWhatsAppClient();
+
+        await whatsappClient.initialize();
+
+    } catch (error) {
+
+        whatsappReady =
+            false;
+
+        whatsappState =
+            "INITIALIZATION_ERROR";
+
+        console.error(
+            "WhatsApp initialization failed:"
+        );
+
+        console.error(
+            error
+        );
+
+    } finally {
+
+        whatsappStarting =
+            false;
+    }
+}
+
+/*
+|--------------------------------------------------------------------------
+| HEALTH
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+    "/health",
+    async (req, res) => {
+
+        let database =
+            false;
+
+        if (pool) {
+
+            try {
+
+                await db(
+                    "SELECT 1"
+                );
+
+                database =
+                    true;
+
+            } catch {
+
+                database =
+                    false;
+            }
+        }
+
+        res.json({
+
+            ok: true,
+
+            service:
+                "whatsapp-automation-platform",
+
+            environment:
+                NODE_ENV,
+
+            database,
+
+            whatsapp: {
+
+                ready:
+                    whatsappReady,
+
+                state:
+                    whatsappState,
+
+                info:
+                    whatsappInfo
+            },
+
+            timestamp:
+                new Date().toISOString()
+        });
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| WHATSAPP STATUS
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+    "/api/whatsapp/status",
+    async (req, res) => {
+
+        try {
+
+            let qr =
+                null;
+
+            if (lastQR) {
+
+                qr =
+                    await QRCode.toDataURL(
+                        lastQR
+                    );
+            }
+
+            res.json({
+
+                ok: true,
+
+                ready:
+                    whatsappReady,
+
+                state:
+                    whatsappState,
+
+                qr,
+
+                info:
+                    whatsappInfo
+            });
+
+        } catch (error) {
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    error.message
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| RESTART WHATSAPP
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    "/api/whatsapp/restart",
+    auth,
+    adminOnly,
+    async (req, res) => {
+
+        try {
+
+            if (whatsappClient) {
+
+                try {
+
+                    await whatsappClient.destroy();
+
+                } catch {}
+            }
+
+            whatsappClient =
+                null;
+
+            whatsappReady =
+                false;
+
+            whatsappState =
+                "RESTARTING";
+
+            lastQR =
+                null;
+
+            whatsappInfo =
+                null;
+
+            await startWhatsApp();
+
+            res.json({
+
+                ok: true,
+
+                message:
+                    "WhatsApp restart requested."
+            });
+
+        } catch (error) {
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    error.message
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| SEND WHATSAPP MESSAGE
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    "/api/whatsapp/send",
+    auth,
+    async (req, res) => {
+
+        try {
+
+            const number =
+                String(
+                    req.body.number || ""
+                )
+                .replace(
+                    /[^\d]/g,
+                    ""
+                );
+
+            const message =
+                String(
+                    req.body.message || ""
+                )
+                .trim();
+
+            if (!number) {
+
+                return res.status(400).json({
+
+                    ok: false,
+
+                    error:
+                        "number is required"
+                });
+            }
+
+            if (!message) {
+
+                return res.status(400).json({
+
+                    ok: false,
+
+                    error:
+                        "message is required"
+                });
+            }
+
+            if (!whatsappClient) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "WhatsApp client is not running"
+                });
+            }
+
+            if (!whatsappReady) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "WhatsApp is not connected"
+                });
+            }
+
+            const exists =
+                await whatsappClient
+                    .isRegisteredUser(
+                        number
+                    );
+
+            if (!exists) {
+
+                return res.status(400).json({
+
+                    ok: false,
+
+                    error:
+                        "This number is not registered on WhatsApp"
+                });
+            }
+
+            const chatId =
+                `${number}@c.us`;
+
+            const sent =
+                await whatsappClient
+                    .sendMessage(
+                        chatId,
+                        message
+                    );
+
+            const accountId =
+                await getMainAccountId();
+
+            if (pool) {
+
+                try {
+
+                    await db(`
+                        INSERT INTO messages
+                        (
+                            whatsapp_account_id,
+                            remote_number,
+                            direction,
+                            message_type,
+                            body
+                        )
+                        VALUES
+                        ($1,$2,$3,$4,$5)
+                    `, [
+                        accountId,
+                        number,
+                        "outgoing",
+                        "text",
+                        message
+                    ]);
+
+                } catch (error) {
+
+                    console.error(
+                        "Outgoing message database error:",
+                        error.message
+                    );
+                }
+            }
+
+            res.json({
+
+                ok: true,
+
+                id:
+                    sent.id?._serialized ||
+                    null,
+
+                to:
+                    number
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Send error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    error.message
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| REGISTER
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    "/api/auth/register",
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "DATABASE_URL is not configured"
+                });
+            }
+
+            const email =
+                String(
+                    req.body.email || ""
+                )
+                .trim()
+                .toLowerCase();
+
+            const password =
+                String(
+                    req.body.password || ""
+                );
+
+            if (
+                !email ||
+                password.length < 6
+            ) {
+
+                return res.status(400).json({
+
+                    ok: false,
+
+                    error:
+                        "Valid email and password of at least 6 characters are required"
+                });
+            }
+
+            const hash =
+                await bcrypt.hash(
+                    password,
+                    12
+                );
+
+            const result =
+                await db(`
+                    INSERT INTO users
+                    (
+                        email,
+                        password_hash
+                    )
+                    VALUES
+                    ($1,$2)
+                    RETURNING
+                        id,
+                        email,
+                        role,
+                        created_at
+                `, [
+                    email,
+                    hash
+                ]);
+
+            const user =
+                result.rows[0];
+
+            res.status(201).json({
+
+                ok: true,
+
+                user,
+
+                token:
+                    createToken(user)
+            });
+
+        } catch (error) {
+
+            if (
+                error.code ===
+                "23505"
+            ) {
+
+                return res.status(409).json({
+
+                    ok: false,
+
+                    error:
+                        "Email already exists"
+                });
+            }
+
+            console.error(
+                "Registration error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Registration failed"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| LOGIN
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    "/api/auth/login",
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "DATABASE_URL is not configured"
+                });
+            }
+
+            const email =
+                String(
+                    req.body.email || ""
+                )
+                .trim()
+                .toLowerCase();
+
+            const password =
+                String(
+                    req.body.password || ""
+                );
+
+            const result =
+                await db(`
+                    SELECT
+                        id,
+                        email,
+                        password_hash,
+                        role,
+                        created_at
+                    FROM users
+                    WHERE email=$1
+                `, [
+                    email
+                ]);
+
+            if (
+                !result.rows.length
+            ) {
+
+                return res.status(401).json({
+
+                    ok: false,
+
+                    error:
+                        "Invalid email or password"
+                });
+            }
+
+            const user =
+                result.rows[0];
+
+            const valid =
+                await bcrypt.compare(
+                    password,
+                    user.password_hash
+                );
+
+            if (!valid) {
+
+                return res.status(401).json({
+
+                    ok: false,
+
+                    error:
+                        "Invalid email or password"
+                });
+            }
+
+            delete user.password_hash;
+
+            res.json({
+
+                ok: true,
+
+                user,
+
+                token:
+                    createToken(user)
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Login error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Login failed"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| CURRENT USER
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+    "/api/me",
+    auth,
+    (req, res) => {
+
+        res.json({
+
+            ok: true,
+
+            user:
+                req.user
+        });
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| LIST ACCOUNTS
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+    "/api/accounts",
+    auth,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+                return res.json([]);
+            }
+
+            let result;
+
+            if (
+                req.user.role ===
+                "admin"
+            ) {
+
+                result =
+                    await db(`
+                        SELECT
+                            id,
+                            user_id,
+                            name,
+                            phone,
+                            status,
+                            session_name,
+                            created_at
+                        FROM whatsapp_accounts
+                        ORDER BY id DESC
+                    `);
+
+            } else {
+
+                result =
+                    await db(`
+                        SELECT
+                            id,
+                            user_id,
+                            name,
+                            phone,
+                            status,
+                            session_name,
+                            created_at
+                        FROM whatsapp_accounts
+                        WHERE user_id=$1
+                        ORDER BY id DESC
+                    `, [
+                        req.user.id
+                    ]);
+            }
+
+            res.json(
+                result.rows
+            );
+
+        } catch (error) {
+
+            console.error(
+                "Accounts error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to load accounts"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| CREATE ACCOUNT
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    "/api/accounts",
+    auth,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "DATABASE_URL is not configured"
+                });
+            }
+
+            const name =
+                String(
+                    req.body.name || ""
+                ).trim();
+
+            if (!name) {
+
+                return res.status(400).json({
+
+                    ok: false,
+
+                    error:
+                        "Account name is required"
+                });
+            }
+
+            const sessionName =
+                `wa-${req.user.id}-${Date.now()}`;
+
+            const result =
+                await db(`
+                    INSERT INTO whatsapp_accounts
+                    (
+                        user_id,
+                        name,
+                        session_name
+                    )
+                    VALUES
+                    ($1,$2,$3)
+                    RETURNING *
+                `, [
+                    req.user.id,
+                    name,
+                    sessionName
+                ]);
+
+            res.status(201).json({
+
+                ok: true,
+
+                account:
+                    result.rows[0]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Create account error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to create WhatsApp account"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| DELETE ACCOUNT
+|--------------------------------------------------------------------------
+*/
+
+app.delete(
+    "/api/accounts/:id",
+    auth,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "DATABASE_URL is not configured"
+                });
+            }
+
+            const accountId =
+                Number(
+                    req.params.id
+                );
+
+            const result =
+                await db(`
+                    SELECT
+                        id,
+                        user_id
+                    FROM whatsapp_accounts
+                    WHERE id=$1
+                `, [
+                    accountId
+                ]);
+
+            if (
+                !result.rows.length
+            ) {
+
+                return res.status(404).json({
+
+                    ok: false,
+
+                    error:
+                        "Account not found"
+                });
+            }
+
+            const account =
+                result.rows[0];
+
+            if (
+                req.user.role !== "admin" &&
+                account.user_id !== req.user.id
+            ) {
+
+                return res.status(403).json({
+
+                    ok: false,
+
+                    error:
+                        "You do not own this account"
+                });
+            }
+
+            await db(`
+                DELETE FROM whatsapp_accounts
+                WHERE id=$1
+            `, [
+                accountId
+            ]);
+
+            res.json({
+
+                ok: true
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Delete account error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to delete account"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| MESSAGES
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+    "/api/messages",
+    auth,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+                return res.json([]);
+            }
+
+            let result;
+
+            if (
+                req.user.role ===
+                "admin"
+            ) {
+
+                result =
+                    await db(`
+                        SELECT *
+                        FROM messages
+                        ORDER BY created_at DESC
+                        LIMIT 500
+                    `);
+
+            } else {
+
+                result =
+                    await db(`
+                        SELECT m.*
+                        FROM messages m
+                        JOIN whatsapp_accounts a
+                          ON a.id =
+                             m.whatsapp_account_id
+                        WHERE a.user_id=$1
+                        ORDER BY m.created_at DESC
+                        LIMIT 500
+                    `, [
+                        req.user.id
+                    ]);
+            }
+
+            res.json(
+                result.rows
+            );
+
+        } catch (error) {
+
+            console.error(
+                "Messages error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to load messages"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| GET AUTOMATION RULES
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+    "/api/rules",
+    auth,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+                return res.json([]);
+            }
+
+            let result;
+
+            if (
+                req.user.role ===
+                "admin"
+            ) {
+
+                result =
+                    await db(`
+                        SELECT *
+                        FROM automation_rules
+                        ORDER BY id DESC
+                    `);
+
+            } else {
+
+                result =
+                    await db(`
+                        SELECT r.*
+                        FROM automation_rules r
+                        JOIN whatsapp_accounts a
+                          ON a.id =
+                             r.whatsapp_account_id
+                        WHERE a.user_id=$1
+                        ORDER BY r.id DESC
+                    `, [
+                        req.user.id
+                    ]);
+            }
+
+            res.json(
+                result.rows
+            );
+
+        } catch (error) {
+
+            console.error(
+                "Rules error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to load automation rules"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| CREATE AUTOMATION RULE
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    "/api/rules",
+    auth,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "DATABASE_URL is not configured"
+                });
+            }
+
+            const accountId =
+                Number(
+                    req.body.whatsapp_account_id
+                );
+
+            const triggerText =
+                String(
+                    req.body.trigger_text ||
+                    ""
+                ).trim();
+
+            const replyText =
+                String(
+                    req.body.reply_text ||
+                    ""
+                ).trim();
+
+            const enabled =
+                req.body.enabled === undefined
+                    ? true
+                    : Boolean(
+                        req.body.enabled
+                    );
+
+            if (
+                !accountId ||
+                !triggerText ||
+                !replyText
+            ) {
+
+                return res.status(400).json({
+
+                    ok: false,
+
+                    error:
+                        "whatsapp_account_id, trigger_text and reply_text are required"
+                });
+            }
+
+            const account =
+                await db(`
+                    SELECT
+                        id,
+                        user_id
+                    FROM whatsapp_accounts
+                    WHERE id=$1
+                `, [
+                    accountId
+                ]);
+
+            if (
+                !account.rows.length
+            ) {
+
+                return res.status(404).json({
+
+                    ok: false,
+
+                    error:
+                        "WhatsApp account not found"
+                });
+            }
+
+            if (
+                req.user.role !== "admin" &&
+                account.rows[0].user_id !==
+                    req.user.id
+            ) {
+
+                return res.status(403).json({
+
+                    ok: false,
+
+                    error:
+                        "You do not own this account"
+                });
+            }
+
+            const result =
+                await db(`
+                    INSERT INTO automation_rules
+                    (
+                        whatsapp_account_id,
+                        trigger_text,
+                        reply_text,
+                        enabled
+                    )
+                    VALUES
+                    ($1,$2,$3,$4)
+                    RETURNING *
+                `, [
+                    accountId,
+                    triggerText,
+                    replyText,
+                    enabled
+                ]);
+
+            res.status(201).json({
+
+                ok: true,
+
+                rule:
+                    result.rows[0]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Create rule error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to create automation rule"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| UPDATE AUTOMATION RULE
+|--------------------------------------------------------------------------
+*/
+
+app.patch(
+    "/api/rules/:id",
+    auth,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "DATABASE_URL is not configured"
+                });
+            }
+
+            const ruleId =
+                Number(
+                    req.params.id
+                );
+
+            const existing =
+                await db(`
+                    SELECT
+                        r.*,
+                        a.user_id
+                    FROM automation_rules r
+                    JOIN whatsapp_accounts a
+                      ON a.id =
+                         r.whatsapp_account_id
+                    WHERE r.id=$1
+                `, [
+                    ruleId
+                ]);
+
+            if (
+                !existing.rows.length
+            ) {
+
+                return res.status(404).json({
+
+                    ok: false,
+
+                    error:
+                        "Automation rule not found"
+                });
+            }
+
+            const oldRule =
+                existing.rows[0];
+
+            if (
+                req.user.role !== "admin" &&
+                oldRule.user_id !== req.user.id
+            ) {
+
+                return res.status(403).json({
+
+                    ok: false,
+
+                    error:
+                        "You do not own this rule"
+                });
+            }
+
+            const triggerText =
+                String(
+                    req.body.trigger_text ??
+                    oldRule.trigger_text
+                ).trim();
+
+            const replyText =
+                String(
+                    req.body.reply_text ??
+                    oldRule.reply_text
+                ).trim();
+
+            const enabled =
+                req.body.enabled === undefined
+                    ? oldRule.enabled
+                    : Boolean(
+                        req.body.enabled
+                    );
+
+            const result =
+                await db(`
+                    UPDATE automation_rules
+                    SET
+                        trigger_text=$1,
+                        reply_text=$2,
+                        enabled=$3
+                    WHERE id=$4
+                    RETURNING *
+                `, [
+                    triggerText,
+                    replyText,
+                    enabled,
+                    ruleId
+                ]);
+
+            res.json({
+
+                ok: true,
+
+                rule:
+                    result.rows[0]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Update rule error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to update automation rule"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| DELETE AUTOMATION RULE
+|--------------------------------------------------------------------------
+*/
+
+app.delete(
+    "/api/rules/:id",
+    auth,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "DATABASE_URL is not configured"
+                });
+            }
+
+            const ruleId =
+                Number(
+                    req.params.id
+                );
+
+            const existing =
+                await db(`
+                    SELECT
+                        r.id,
+                        a.user_id
+                    FROM automation_rules r
+                    JOIN whatsapp_accounts a
+                      ON a.id =
+                         r.whatsapp_account_id
+                    WHERE r.id=$1
+                `, [
+                    ruleId
+                ]);
+
+            if (
+                !existing.rows.length
+            ) {
+
+                return res.status(404).json({
+
+                    ok: false,
+
+                    error:
+                        "Automation rule not found"
+                });
+            }
+
+            if (
+                req.user.role !== "admin" &&
+                existing.rows[0].user_id !==
+                    req.user.id
+            ) {
+
+                return res.status(403).json({
+
+                    ok: false,
+
+                    error:
+                        "You do not own this rule"
+                });
+            }
+
+            await db(`
+                DELETE FROM automation_rules
+                WHERE id=$1
+            `, [
+                ruleId
+            ]);
+
+            res.json({
+
+                ok: true
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Delete rule error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to delete automation rule"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| ADMIN - USERS
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+    "/api/admin/users",
+    auth,
+    adminOnly,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+                return res.json([]);
+            }
+
+            const result =
+                await db(`
+                    SELECT
+                        id,
+                        email,
+                        role,
+                        created_at
+                    FROM users
+                    ORDER BY id DESC
+                `);
+
+            res.json(
+                result.rows
+            );
+
+        } catch (error) {
+
+            console.error(
+                "Admin users error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to load users"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| ADMIN - CHANGE USER ROLE
+|--------------------------------------------------------------------------
+*/
+
+app.patch(
+    "/api/admin/users/:id/role",
+    auth,
+    adminOnly,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "DATABASE_URL is not configured"
+                });
+            }
+
+            const userId =
+                Number(
+                    req.params.id
+                );
+
+            const role =
+                String(
+                    req.body.role || ""
+                ).trim();
+
+            if (
+                role !== "admin" &&
+                role !== "customer"
+            ) {
+
+                return res.status(400).json({
+
+                    ok: false,
+
+                    error:
+                        "role must be admin or customer"
+                });
+            }
+
+            const result =
+                await db(`
+                    UPDATE users
+                    SET role=$1
+                    WHERE id=$2
+                    RETURNING
+                        id,
+                        email,
+                        role,
+                        created_at
+                `, [
+                    role,
+                    userId
+                ]);
+
+            if (
+                !result.rows.length
+            ) {
+
+                return res.status(404).json({
+
+                    ok: false,
+
+                    error:
+                        "User not found"
+                });
+            }
+
+            res.json({
+
+                ok: true,
+
+                user:
+                    result.rows[0]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Role update error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to update user role"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| ADMIN - DELETE USER
+|--------------------------------------------------------------------------
+*/
+
+app.delete(
+    "/api/admin/users/:id",
+    auth,
+    adminOnly,
+    async (req, res) => {
+
+        try {
+
+            if (!pool) {
+
+                return res.status(503).json({
+
+                    ok: false,
+
+                    error:
+                        "DATABASE_URL is not configured"
+                });
+            }
+
+            const userId =
+                Number(
+                    req.params.id
+                );
+
+            if (
+                userId === req.user.id
+            ) {
+
+                return res.status(400).json({
+
+                    ok: false,
+
+                    error:
+                        "You cannot delete your own administrator account"
+                });
+            }
+
+            const result =
+                await db(`
+                    DELETE FROM users
+                    WHERE id=$1
+                    RETURNING
+                        id,
+                        email
+                `, [
+                    userId
+                ]);
+
+            if (
+                !result.rows.length
+            ) {
+
+                return res.status(404).json({
+
+                    ok: false,
+
+                    error:
+                        "User not found"
+                });
+            }
+
+            res.json({
+
+                ok: true,
+
+                deleted:
+                    result.rows[0]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Delete user error:",
+                error
+            );
+
+            res.status(500).json({
+
+                ok: false,
+
+                error:
+                    "Unable to delete user"
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| DASHBOARD
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+    "/",
+    (req, res) => {
+
+        res.sendFile(
+            path.join(
+                __dirname,
+                "public",
+                "index.html"
+            )
+        );
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| API 404
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    "/api",
+    (req, res) => {
+
+        res.status(404).json({
+
+            ok: false,
+
+            error:
+                "API endpoint not found"
+        });
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| EXPRESS ERROR HANDLER
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    (
+        error,
+        req,
+        res,
+        next
+    ) => {
+
+        console.error(
+            "Express error:",
+            error
+        );
+
+        if (
+            res.headersSent
+        ) {
+            return next(
+                error
+            );
+        }
+
+        res.status(500).json({
+
+            ok: false,
+
+            error:
+                NODE_ENV ===
+                "production"
+
+                    ? "Internal server error"
+
+                    : error.message
+        });
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| HTTP SERVER
+|--------------------------------------------------------------------------
+*/
+
+let httpServer =
+    null;
+
+/*
+|--------------------------------------------------------------------------
+| START APPLICATION
+|--------------------------------------------------------------------------
+*/
+
+async function start() {
+
+    console.log("");
+
+    console.log(
+        "======================================"
+    );
+
+    console.log(
+        " WHATSAPP AUTOMATION PLATFORM"
+    );
+
+    console.log(
+        "======================================"
+    );
+
+    console.log(
+        "Node:",
+        process.version
+    );
+
+    console.log(
+        "Environment:",
+        NODE_ENV
+    );
+
+    console.log(
+        "Worker:",
+        WORKER_ID
+    );
+
+    console.log("");
+
+    try {
+
+        await initializeDatabase();
+
+    } catch (error) {
+
+        console.error(
+            "Database initialization error:",
+            error.message
+        );
+    }
+
+    httpServer =
+        app.listen(
+            PORT,
+            HOST,
+            () => {
+
+                console.log(
+                    "API listening on:",
+                    `${HOST}:${PORT}`
+                );
+
+                console.log(
+                    "Health:",
+                    `http://localhost:${PORT}/health`
+                );
+
+                console.log(
+                    "WhatsApp status:",
+                    `http://localhost:${PORT}/api/whatsapp/status`
+                );
+
+                console.log("");
+            }
+        );
+
+    httpServer.on(
+        "error",
+        error => {
+
+            if (
+                error.code ===
+                "EADDRINUSE"
+            ) {
+
+                console.error("");
+
+                console.error(
+                    `PORT ${PORT} is already in use.`
+                );
+
+                console.error(
+                    "Stop the other Node process or use another PORT."
+                );
+
+                console.error("");
+
+                process.exit(1);
+
+            } else {
+
+                console.error(
+                    "HTTP server error:",
+                    error
+                );
+            }
+        }
+    );
+
+    await startWhatsApp();
+}
+
+/*
+|--------------------------------------------------------------------------
+| START
+|--------------------------------------------------------------------------
+*/
+
+start().catch(
+    error => {
+
+        console.error(
+            "Fatal startup error:",
+            error
+        );
+
+        process.exit(1);
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| GRACEFUL SHUTDOWN
+|--------------------------------------------------------------------------
+*/
+
+let shuttingDown =
+    false;
+
+async function shutdown(
+    signal
+) {
+
+    if (shuttingDown) {
+        return;
+    }
+
+    shuttingDown =
+        true;
+
+    console.log(
+        `Received ${signal}. Shutting down...`
+    );
+
+    try {
+
+        if (
+            whatsappClient
+        ) {
+
+            await whatsappClient.destroy();
+        }
+
+    } catch (error) {
+
+        console.error(
+            "WhatsApp shutdown error:",
+            error.message
+        );
+    }
+
+    try {
+
+        if (pool) {
+
+            await pool.end();
+        }
+
+    } catch (error) {
+
+        console.error(
+            "Database shutdown error:",
+            error.message
+        );
+    }
+
+    try {
+
+        if (httpServer) {
+
+            await new Promise(
+                resolve => {
+
+                    httpServer.close(
+                        resolve
+                    );
+                }
+            );
+        }
+
+    } catch {}
+
+    process.exit(0);
+}
+
+process.on(
+    "SIGINT",
+    () => shutdown("SIGINT")
+);
+
+process.on(
+    "SIGTERM",
+    () => shutdown("SIGTERM")
+);
+
+

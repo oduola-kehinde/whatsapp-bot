@@ -1,0 +1,557 @@
+﻿"use strict";
+
+const WhatsAppSessionManager =
+    require("./SessionManager");
+
+class MultiAccountWhatsApp {
+    constructor(db) {
+        this.db = db;
+
+        this.manager =
+            new WhatsAppSessionManager();
+
+        this.bindEvents();
+    }
+
+    bindEvents() {
+
+        this.manager.on("qr", async ({ accountId, qr }) => {
+            console.log(
+                `[WHATSAPP][${accountId}] QR code required`
+            );
+
+            await this.updateStatus(
+                accountId,
+                "qr_required",
+                null
+            );
+        });
+
+        this.manager.on("authenticated", async ({ accountId }) => {
+            console.log(
+                `[WHATSAPP][${accountId}] authenticated`
+            );
+
+            await this.updateStatus(
+                accountId,
+                "authenticated",
+                null
+            );
+        });
+
+        this.manager.on("ready", async ({ accountId, info }) => {
+            console.log(
+                `[WHATSAPP][${accountId}] connected:`,
+                info?.phone || "unknown"
+            );
+
+            await this.updateStatus(
+                accountId,
+                "connected",
+                info?.phone || null
+            );
+        });
+
+        this.manager.on(
+            "auth_failure",
+            async ({ accountId, message }) => {
+                console.error(
+                    `[WHATSAPP][${accountId}] authentication failure:`,
+                    message
+                );
+
+                await this.updateStatus(
+                    accountId,
+                    "auth_failure",
+                    null
+                );
+            }
+        );
+
+        this.manager.on(
+            "disconnected",
+            async ({ accountId, reason }) => {
+                console.log(
+                    `[WHATSAPP][${accountId}] disconnected:`,
+                    reason
+                );
+
+                await this.updateStatus(
+                    accountId,
+                    "disconnected",
+                    null
+                );
+            }
+        );
+
+        this.manager.on(
+            "message",
+            async ({ accountId, message, client }) => {
+
+                if (message?.isStatus) {
+                    await this.handleStatus(
+                        accountId,
+                        message,
+                        client
+                    );
+                    return;
+                }
+
+                await this.handleIncoming(
+                    accountId,
+                    message
+                );
+            }
+        );
+
+        this.manager.on(
+            "error",
+            ({ accountId, error }) => {
+                console.error(
+                    `[WHATSAPP][${accountId}] error:`,
+                    error.message
+                );
+            }
+        );
+    }
+
+    async updateStatus(
+        accountId,
+        status,
+        phone
+    ) {
+        if (!this.db) return;
+
+        try {
+            await this.db(
+                `
+                UPDATE whatsapp_accounts
+                SET status=$1,
+                    phone=$2
+                WHERE id=$3
+                `,
+                [
+                    status,
+                    phone,
+                    Number(accountId)
+                ]
+            );
+        } catch (error) {
+            console.error(
+                "WhatsApp account status update failed:",
+                error.message
+            );
+        }
+    }
+
+    async getAccount(accountId) {
+        if (!this.db) {
+            throw new Error(
+                "Database is not configured"
+            );
+        }
+
+        const result =
+            await this.db(
+                `
+                SELECT
+                    id,
+                    user_id,
+                    name,
+                    phone,
+                    status,
+                    session_name
+                FROM whatsapp_accounts
+                WHERE id=$1
+                `,
+                [Number(accountId)]
+            );
+
+        return result.rows[0] || null;
+    }
+
+    async startAccount(accountId) {
+        const account =
+            await this.getAccount(accountId);
+
+        if (!account) {
+            throw new Error(
+                "WhatsApp account not found"
+            );
+        }
+
+        return this.manager.start(
+            account.session_name
+        );
+    }
+
+    async stopAccount(accountId) {
+        const account =
+            await this.getAccount(accountId);
+
+        if (!account) {
+            throw new Error(
+                "WhatsApp account not found"
+            );
+        }
+
+        return this.manager.stop(
+            account.session_name
+        );
+    }
+
+    async restartAccount(accountId) {
+        const account =
+            await this.getAccount(accountId);
+
+        if (!account) {
+            throw new Error(
+                "WhatsApp account not found"
+            );
+        }
+
+        return this.manager.restart(
+            account.session_name
+        );
+    }
+
+    async send(accountId, number, text) {
+        const account =
+            await this.getAccount(accountId);
+
+        if (!account) {
+            throw new Error(
+                "WhatsApp account not found"
+            );
+        }
+
+        const sent =
+            await this.manager.sendMessage(
+                account.session_name,
+                number,
+                text
+            );
+
+        if (this.db) {
+            await this.db(
+                `
+                INSERT INTO messages
+                (
+                    whatsapp_account_id,
+                    remote_number,
+                    direction,
+                    message_type,
+                    body
+                )
+                VALUES
+                ($1,$2,$3,$4,$5)
+                `,
+                [
+                    account.id,
+                    String(number),
+                    "outgoing",
+                    "text",
+                    String(text)
+                ]
+            );
+        }
+
+        return sent;
+    }
+
+    status(accountId) {
+        return this.manager.status(
+            accountId
+        );
+    }
+
+    allStatuses() {
+        return this.manager.allStatuses();
+    }
+
+    async startAllAccounts() {
+        if (!this.db) {
+            return [];
+        }
+
+        const result =
+            await this.db(
+                `
+                SELECT
+                    id,
+                    session_name
+                FROM whatsapp_accounts
+                ORDER BY id ASC
+                `
+            );
+
+        const output = [];
+
+        for (const account of result.rows) {
+            try {
+                const status =
+                    await this.manager.start(
+                        account.session_name
+                    );
+
+                output.push({
+                    id: account.id,
+                    session_name:
+                        account.session_name,
+                    ok: true,
+                    status
+                });
+            } catch (error) {
+                output.push({
+                    id: account.id,
+                    session_name:
+                        account.session_name,
+                    ok: false,
+                    error: error.message
+                });
+            }
+        }
+
+        return output;
+    }
+
+    async handleStatus(
+        accountSessionName,
+        message,
+        client
+    ) {
+        try {
+            const sender =
+                String(
+                    message.author ||
+                    message.participant ||
+                    message.from ||
+                    "unknown"
+                );
+
+            console.log("");
+            console.log(
+                "========================================"
+            );
+            console.log(
+                `[WHATSAPP][${accountSessionName}] STATUS DETECTED`
+            );
+            console.log(
+                `[WHATSAPP][${accountSessionName}] From: ${sender}`
+            );
+            console.log(
+                `[WHATSAPP][${accountSessionName}] Type: ${message.type || "unknown"}`
+            );
+
+            /*
+             * Ask WhatsApp Web to mark the status broadcast
+             * chat as seen.
+             */
+            try {
+                if (client && typeof client.sendSeen === "function") {
+                    await client.sendSeen("status@broadcast");
+
+                    console.log(
+                        `[WHATSAPP][${accountSessionName}] STATUS VIEW ATTEMPT: SUCCESS`
+                    );
+                } else {
+                    console.log(
+                        `[WHATSAPP][${accountSessionName}] STATUS VIEW: sendSeen unavailable`
+                    );
+                }
+            } catch (viewError) {
+                console.error(
+                    `[WHATSAPP][${accountSessionName}] STATUS VIEW FAILED:`,
+                    viewError.message
+                );
+            }
+
+            /*
+             * React to the status.
+             */
+            try {
+                if (
+                    typeof message.react === "function"
+                ) {
+                    await message.react("❤️");
+
+                    console.log(
+                        `[WHATSAPP][${accountSessionName}] STATUS LIKE/REACTION: SUCCESS ❤️`
+                    );
+                } else {
+                    console.log(
+                        `[WHATSAPP][${accountSessionName}] STATUS REACTION: message.react unavailable`
+                    );
+                }
+            } catch (reactionError) {
+                console.error(
+                    `[WHATSAPP][${accountSessionName}] STATUS REACTION FAILED:`,
+                    reactionError.message
+                );
+            }
+
+            console.log(
+                "========================================"
+            );
+            console.log("");
+
+        } catch (error) {
+            console.error(
+                `[WHATSAPP][${accountSessionName}] STATUS HANDLER ERROR:`,
+                error.message
+            );
+        }
+    }
+
+    async handleIncoming(
+        accountSessionName,
+        message
+    ) {
+        if (!this.db) return;
+
+        try {
+            const accountResult =
+                await this.db(
+                    `
+                    SELECT id
+                    FROM whatsapp_accounts
+                    WHERE session_name=$1
+                    LIMIT 1
+                    `,
+                    [accountSessionName]
+                );
+
+            const account =
+                accountResult.rows[0];
+
+            if (!account) {
+                console.error(
+                    "Incoming message belongs to unknown account:",
+                    accountSessionName
+                );
+                return;
+            }
+
+            const text =
+                String(
+                    message.body || ""
+                ).trim();
+
+            if (!text) return;
+
+            await this.db(
+                `
+                INSERT INTO messages
+                (
+                    whatsapp_account_id,
+                    remote_number,
+                    direction,
+                    message_type,
+                    body
+                )
+                VALUES
+                ($1,$2,$3,$4,$5)
+                `,
+                [
+                    account.id,
+                    message.from,
+                    "incoming",
+                    "text",
+                    text
+                ]
+            );
+
+            const command =
+                text.toLowerCase();
+
+            if (command === "!ping") {
+                await message.reply("pong");
+                return;
+            }
+
+            if (command === "!status") {
+                await message.reply(
+                    "WhatsApp bot is online."
+                );
+                return;
+            }
+
+            if (command === "!help") {
+                await message.reply(
+                    "WhatsApp Bot Commands\n\n" +
+                    "!ping - Test the bot\n" +
+                    "!status - Check bot status\n" +
+                    "!help - Show commands"
+                );
+                return;
+            }
+
+            const rules =
+                await this.db(
+                    `
+                    SELECT
+                        id,
+                        trigger_text,
+                        reply_text
+                    FROM automation_rules
+                    WHERE
+                        whatsapp_account_id=$1
+                        AND enabled=true
+                    ORDER BY id ASC
+                    `,
+                    [account.id]
+                );
+
+            const matched =
+                rules.rows.find(
+                    rule =>
+                        String(
+                            rule.trigger_text || ""
+                        )
+                        .trim()
+                        .toLowerCase() === command
+                );
+
+            if (matched) {
+                await message.reply(
+                    matched.reply_text
+                );
+
+                await this.db(
+                    `
+                    INSERT INTO messages
+                    (
+                        whatsapp_account_id,
+                        remote_number,
+                        direction,
+                        message_type,
+                        body
+                    )
+                    VALUES
+                    ($1,$2,$3,$4,$5)
+                    `,
+                    [
+                        account.id,
+                        message.from,
+                        "outgoing",
+                        "text",
+                        matched.reply_text
+                    ]
+                );
+            }
+
+        } catch (error) {
+            console.error(
+                "Multi-account incoming message error:",
+                error.message
+            );
+        }
+    }
+
+    async shutdown() {
+        await this.manager.destroyAll();
+    }
+}
+
+module.exports = MultiAccountWhatsApp;
+

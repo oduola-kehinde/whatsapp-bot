@@ -1,0 +1,638 @@
+﻿
+"use strict";
+
+const path = require("path");
+const fs = require("fs");
+const {
+    Client,
+    LocalAuth
+} = require("whatsapp-web.js");
+const puppeteer = require("puppeteer");
+const EventEmitter = require("events");
+
+class WhatsAppSessionManager extends EventEmitter {
+    constructor(options = {}) {
+        super();
+
+        this.sessions = new Map();
+
+        this.baseAuthPath =
+            options.authPath ||
+            process.env.WHATSAPP_SESSION_PATH ||
+            path.join(process.cwd(), ".wwebjs_auth");
+
+        this.headless =
+            options.headless !== false;
+
+        this.chromePath =
+            options.chromePath ||
+            puppeteer.executablePath();
+
+        fs.mkdirSync(this.baseAuthPath, {
+            recursive: true
+        });
+    }
+
+    normalizeId(accountId) {
+        const id = String(accountId || "").trim();
+
+        if (!id) {
+            throw new Error("WhatsApp account ID is required");
+        }
+
+        if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+            throw new Error("Invalid WhatsApp account ID");
+        }
+
+        return id;
+    }
+
+    get(accountId) {
+        return this.sessions.get(
+            this.normalizeId(accountId)
+        ) || null;
+    }
+
+    has(accountId) {
+        return this.sessions.has(
+            this.normalizeId(accountId)
+        );
+    }
+
+    status(accountId) {
+        const id = this.normalizeId(accountId);
+        const session = this.sessions.get(id);
+
+        if (!session) {
+            return {
+                accountId: id,
+                status: "stopped",
+                ready: false,
+                phone: null,
+                pushname: null,
+                platform: null
+            };
+        }
+
+        return {
+            accountId: id,
+            status: session.status,
+            ready: session.ready,
+            phone: session.phone,
+            pushname: session.pushname,
+            platform: session.platform
+        };
+    }
+
+    allStatuses() {
+        return Array.from(
+            this.sessions.keys()
+        ).map((id) => this.status(id));
+    }
+
+    createClient(accountId) {
+        const id = this.normalizeId(accountId);
+
+        const client = new Client({
+            authStrategy: new LocalAuth({
+                clientId: `account-${id}`,
+                dataPath: this.baseAuthPath
+            }),
+
+            puppeteer: {
+                headless: this.headless,
+                protocolTimeout: 180000,
+
+                executablePath: this.chromePath,
+
+                protocolTimeout: 120000,
+
+                timeout: 120000,
+                args: [
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--no-first-run",
+                    "--no-zygote",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding",
+                    "--disable-features=Translate,BackForwardCache"
+                ]
+            }
+        });
+
+        const session = {
+            accountId: id,
+            client,
+            status: "created",
+            ready: false,
+            phone: null,
+            pushname: null,
+            platform: null,
+            startedAt: new Date(),
+            lastError: null
+        };
+
+        this.sessions.set(id, session);
+
+        client.on("qr", (qr) => {
+            session.status = "qr";
+            session.ready = false;
+
+            this.emit("qr", {
+                accountId: id,
+                qr
+            });
+        });
+
+        client.on("authenticated", () => {
+            session.status = "authenticated";
+
+            this.emit("authenticated", {
+                accountId: id
+            });
+        });
+
+        client.on("ready", () => {
+            session.status = "ready";
+            session.ready = true;
+
+            try {
+                const info = client.info;
+
+                session.phone =
+                    info?.wid?.user ||
+                    null;
+
+                session.pushname =
+                    info?.pushname ||
+                    null;
+
+                session.platform =
+                    info?.platform ||
+                    null;
+            } catch (error) {
+                session.lastError =
+                    error.message;
+            }
+
+            console.log(
+                `[WHATSAPP][${id}] READY`
+            );
+
+            this.emit("ready", {
+                accountId: id,
+                info: {
+                    phone: session.phone,
+                    pushname: session.pushname,
+                    platform: session.platform
+                }
+            });
+        });
+
+        client.on("auth_failure", (message) => {
+            session.status = "auth_failure";
+            session.ready = false;
+            session.lastError = String(message);
+
+            this.emit("auth_failure", {
+                accountId: id,
+                message: String(message)
+            });
+        });
+
+        client.on("disconnected", (reason) => {
+            session.status = "disconnected";
+            session.ready = false;
+
+            this.emit("disconnected", {
+                accountId: id,
+                reason: String(reason)
+            });
+        });
+
+        client.on("change_state", (state) => {
+            this.emit("change_state", {
+                accountId: id,
+                state
+            });
+        });
+
+        // ============================================================
+        // AUTOMATIC WHATSAPP STATUS VIEW + LIKE
+        // ============================================================
+        client.on("message", async (message) => {
+
+            const isStatus =
+                message.isStatus === true ||
+                message.from === "status@broadcast";
+
+            if (isStatus) {
+
+                console.log("");
+                console.log(
+                    "================================================"
+                );
+                console.log(
+                    `[WHATSAPP][${id}] STATUS DETECTED`
+                );
+                console.log(
+                    "================================================"
+                );
+
+                // ----------------------------------------------------
+                // VIEW / MARK STATUS AS SEEN
+                // ----------------------------------------------------
+                try {
+
+                    const chat =
+                        await message.getChat();
+
+                    if (chat) {
+
+                        const seenResult =
+                            await chat.sendSeen();
+
+                        console.log(
+                            `[WHATSAPP][${id}] STATUS VIEW RESULT:`,
+                            seenResult
+                        );
+
+                        console.log(
+                            `[WHATSAPP][${id}] STATUS VIEWED`
+                        );
+
+                    } else {
+
+                        console.log(
+                            `[WHATSAPP][${id}] STATUS CHAT NOT FOUND`
+                        );
+                    }
+
+                } catch (error) {
+
+                    console.error(
+                        `[WHATSAPP][${id}] STATUS VIEW FAILED:`,
+                        error.message
+                    );
+                }
+
+                // ----------------------------------------------------
+                // LIKE / REACT WITH HEART
+                // ----------------------------------------------------
+                try {
+
+                    await message.react("❤️");
+
+                    console.log(
+                        `[WHATSAPP][${id}] STATUS LIKED ❤️`
+                    );
+
+                } catch (error) {
+
+                    console.error(
+                        `[WHATSAPP][${id}] STATUS LIKE FAILED:`,
+                        error.message
+                    );
+                }
+
+                console.log(
+                    "================================================"
+                );
+                console.log("");
+
+                // Do not process the status as a normal message.
+                return;
+            }
+
+            // ========================================================
+            // NORMAL MESSAGE
+            // ========================================================
+            this.emit("message", {
+                accountId: id,
+                message,
+                client
+            });
+        });
+
+        client.on("error", (error) => {
+            session.status = "error";
+            session.ready = false;
+            session.lastError = error.message;
+
+            this.emit("error", {
+                accountId: id,
+                error
+            });
+        });
+
+        return session;
+    }
+
+    async start(accountId) {
+        const id = this.normalizeId(accountId);
+
+        let session = this.sessions.get(id);
+
+        if (session?.ready) {
+            return this.status(id);
+        }
+
+        if (!session) {
+            session = this.createClient(id);
+        }
+
+        if (session.status === "starting") {
+            return this.status(id);
+        }
+
+        session.status = "starting";
+        session.lastError = null;
+
+        try {
+            await session.client.initialize();
+
+            return this.status(id);
+
+        } catch (error) {
+
+            session.status = "error";
+            session.ready = false;
+            session.lastError = error.message;
+
+            this.emit("error", {
+                accountId: id,
+                error
+            });
+
+            throw error;
+        }
+    }
+
+    async stop(accountId) {
+        const id = this.normalizeId(accountId);
+        const session = this.sessions.get(id);
+
+        if (!session) {
+            return this.status(id);
+        }
+
+        try {
+            await session.client.destroy();
+
+        } finally {
+
+            session.status = "stopped";
+            session.ready = false;
+        }
+
+        return this.status(id);
+    }
+
+    async restart(accountId) {
+        const id = this.normalizeId(accountId);
+
+        await this.stop(id);
+
+        this.sessions.delete(id);
+
+        return this.start(id);
+    }
+
+    async sendMessage(accountId, number, text) {
+        const id = this.normalizeId(accountId);
+        const session = this.sessions.get(id);
+
+        if (!session) {
+            throw new Error(
+                `WhatsApp account ${id} is not running`
+            );
+        }
+
+        if (!session.ready) {
+            throw new Error(
+                `WhatsApp account ${id} is not connected`
+            );
+        }
+
+        const cleanNumber =
+            String(number || "")
+                .replace(/[^\d]/g, "");
+
+        if (!cleanNumber) {
+            throw new Error(
+                "WhatsApp destination number is required"
+            );
+        }
+
+        const body =
+            String(text || "").trim();
+
+        if (!body) {
+            throw new Error(
+                "Message text is required"
+            );
+        }
+
+        const chatId =
+            `${cleanNumber}@c.us`;
+
+        const registered =
+            await session.client
+                .isRegisteredUser(chatId);
+
+        if (!registered) {
+            throw new Error(
+                "This number is not registered on WhatsApp"
+            );
+        }
+
+        return session.client.sendMessage(
+            chatId,
+            body
+        );
+    }
+
+    async testStatusAutomation(accountId, reaction = "❤️") {
+        const id = this.normalizeId(accountId);
+        const session = this.sessions.get(id);
+
+        if (!session) {
+            throw new Error(`WhatsApp account ${id} is not running`);
+        }
+
+        if (!session.ready) {
+            throw new Error(`WhatsApp account ${id} is not connected`);
+        }
+
+        const client = session.client;
+
+        if (!client.pupPage) {
+            throw new Error("WhatsApp browser page is not available");
+        }
+
+        console.log(`[STATUS TEST][${id}] Starting status test...`);
+
+        const result = await client.pupPage.evaluate(async (reactionEmoji) => {
+            try {
+                const W = window.WAWebJS;
+
+                if (!W) {
+                    return {
+                        ok: false,
+                        step: "internal-api",
+                        error: "WhatsApp Web internal API is not available"
+                    };
+                }
+
+                let statusChat = null;
+
+                try {
+                    if (W.getChat) {
+                        statusChat = await W.getChat("status@broadcast");
+                    }
+                } catch (_) {}
+
+                if (!statusChat) {
+                    try {
+                        const chats = await W.getChats();
+                        statusChat = chats.find(
+                            c =>
+                                c.id &&
+                                (
+                                    c.id._serialized === "status@broadcast" ||
+                                    c.id.user === "status"
+                                )
+                        );
+                    } catch (_) {}
+                }
+
+                if (!statusChat) {
+                    return {
+                        ok: false,
+                        step: "find-status",
+                        error: "WhatsApp Status chat was not found"
+                    };
+                }
+
+                let messages = [];
+
+                try {
+                    if (W.getChatMessages) {
+                        messages = await W.getChatMessages(
+                            statusChat,
+                            20,
+                            undefined,
+                            true
+                        );
+                    }
+                } catch (_) {}
+
+                if (!Array.isArray(messages)) {
+                    messages = [];
+                }
+
+                const statuses = messages.filter(m => {
+                    const id = m?.id?._serialized || "";
+                    const from = m?.from || "";
+                    return (
+                        id.includes("status@broadcast") ||
+                        from === "status@broadcast"
+                    );
+                });
+
+                if (!statuses.length) {
+                    return {
+                        ok: true,
+                        step: "find-status",
+                        viewed: false,
+                        reacted: false,
+                        message: "No recent WhatsApp Status items were available."
+                    };
+                }
+
+                const target = statuses[statuses.length - 1];
+
+                let viewed = false;
+                let reacted = false;
+                let viewError = null;
+                let reactionError = null;
+
+                try {
+                    if (W.sendSeen) {
+                        await W.sendSeen(target.id);
+                        viewed = true;
+                    }
+                } catch (e) {
+                    viewError = String(e?.message || e);
+                }
+
+                try {
+                    if (W.sendReactionToStatus) {
+                        await W.sendReactionToStatus(
+                            target.id,
+                            reactionEmoji
+                        );
+                        reacted = true;
+                    }
+                } catch (e) {
+                    reactionError = String(e?.message || e);
+                }
+
+                return {
+                    ok: viewed || reacted,
+                    step: "complete",
+                    viewed,
+                    reacted,
+                    reaction: reactionEmoji,
+                    statusId: target?.id?._serialized || null,
+                    viewError,
+                    reactionError
+                };
+
+            } catch (e) {
+                return {
+                    ok: false,
+                    step: "exception",
+                    error: String(e?.message || e)
+                };
+            }
+        }, reaction);
+
+        console.log(
+            `[STATUS TEST][${id}] Result:`,
+            JSON.stringify(result, null, 2)
+        );
+
+        return result;
+    }
+    async destroyAll() {
+        const ids =
+            Array.from(this.sessions.keys());
+
+        for (const id of ids) {
+
+            try {
+
+                await this.stop(id);
+
+            } catch (error) {
+
+                console.error(
+                    `Failed to stop WhatsApp account ${id}:`,
+                    error.message
+                );
+            }
+        }
+
+        this.sessions.clear();
+    }
+}
+
+module.exports = WhatsAppSessionManager;
+
+
